@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -12,6 +13,9 @@ import uuid
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
+
+# 我的logging...
+import wandb
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -1276,7 +1280,20 @@ class Hyperparameters:
     ws_validate: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
 
+# -----------------------------------------------------------------------------
+# Hooking my own args here
+
+arg_parser = argparse.ArgumentParser()
+arg_parser.add_argument("data_path", type=str)
+arg_parser.add_argument("paradigm", type=str)
+arg_parser.add_argument("language", type=str)
+
+arg_parser_args = arg_parser.parse_args()
+
 args = Hyperparameters()
+os.environ["DATA_PATH"] = arg_parser_args.data_path
+args.train_files = f"{arg_parser_args.language}_{arg_parser_args.paradigm}_CORPUS/{arg_parser_args.language}_{arg_parser_args.paradigm}_train_*.bin"
+args.train_files = f"{arg_parser_args.language}_{arg_parser_args.paradigm}_CORPUS/{arg_parser_args.language}_{arg_parser_args.paradigm}_val_*.bin"
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1416,6 +1433,11 @@ def step_optimizers(step: int, optimizers, model):
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
+# -----------------------------------------------------------------------------
+# hooking tracking with weights and biases
+wandb.init(project=f"{arg_parser_args.language}_{arg_parser_args.paradigm}")
+wandb.watch(model, log="all", loq_freq=100)
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -1502,7 +1524,11 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     for _ in range(grad_accum_steps):
         inputs, targets, cum_seqlens = next(train_loader)
-        model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
+        loss = model(inputs, targets, cum_seqlens, ws_short, ws_long)
+        wandb.log({
+            "loss": loss,
+        })
+        loss.backward()
     step_optimizers(step, optimizers, model)
      
     # logging
