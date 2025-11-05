@@ -349,3 +349,10 @@ compared to Shampoo.
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
 
+## My insignificant Contributions
+I hate that this code is all hard-coded, but I understand why it is so; it was written by many people who have already crystallized the requisite information to be expertts and amazing at what they're doing.
+
+Areas to pick out that should be able to be hotswapped
+
+NORMALIZATION FUNCTION : The normalization function used to perform layer normalization. MNGPT used root mean sqaure. This is QKNORM, since the dot product of two rms normalized vectors is the cosine similarity
+POSITIONAL ENCODING LAYER : The method of assigning absolute position to sequence tokens. MNGPT uses RoPE in self.rotary

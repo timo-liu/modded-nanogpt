@@ -34,6 +34,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
+# fp8 matrix multiplication just to save on FLOPs, I guess UPDATE
 @torch.library.custom_op("nanogpt::mm", mutates_args=())
 def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
     @torch.compile
@@ -79,6 +80,7 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
             use_fast_accum=False,
         )
         # faster than grad_f8_t @ x_f8, for (d_out, d_in) == (50304, 768)
+        # disgusting, some cs magic trickery that does fp8 multiplications faster UPDATE
         grad_w = torch._scaled_mm(
             x_f8.T.contiguous(),
             grad_f8.T.contiguous().T,
@@ -289,6 +291,8 @@ class DistAdam(torch.optim.Optimizer):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
+# NORMALIZATION FUNCTION
+
 def norm(x: Tensor):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -344,6 +348,7 @@ class CausalSelfAttention(nn.Module):
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
+        # POSITIONAL ENCODING LAYER
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
@@ -384,6 +389,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        # similar intuition to Unet value embedding skipping UPDATE
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
 
@@ -401,13 +407,17 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int,
+                 # my modifications
+                 u_net_ledges : int = 3):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
+        self.u_net_ledges = u_net_ledges # setting the ledges for the unet value embedding
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        # stacking the embedding layers into a ModuleList, one for Input, two for value embeddings? UPDATE
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(u_net_ledges)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -430,9 +440,9 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 27.5
         self.scalars.lr_mul = 5.0
 
-    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
+    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor, eos_id : int = 50526):
         BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
+        docs = (input_seq == eos_id).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -475,7 +485,10 @@ class GPT(nn.Module):
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+
+        # learn why and modify to make it work for layer counts < 6
+        # modified to be parameter driven u-net
+        ve = [ve[i] for i in range(self.u_net_ledges)] + [None] * (len(self.blocks) - (self.u_net_ledges * 2)) + [ve[i] for i in range(self.u_net_ledges)]
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
@@ -536,7 +549,7 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
             start = end
     assert False # increase max_batch_span if necessary
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_eos: bool):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
@@ -544,11 +557,11 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    max_batch_span = 2 * batch_size if align_to_eos else batch_size # provide buffer to handle samples up to length local_batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
-        if align_to_bos:
+        if align_to_eos:
             batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
             start_idx = batch_starts[rank]
         else:
@@ -582,7 +595,7 @@ args = Hyperparameters()
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+#assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -598,9 +611,12 @@ parser.add_argument("paradigm", type=str)
 parser.add_argument("language", type=str)
 cli_args = parser.parse_args()
 
-os.environ["DATA_PATH"] = arg_parser_args.data_path
-args.train_files = f"{arg_parser_args.language}_{arg_parser_args.paradigm}_CORPUS/{arg_parser_args.language}_{arg_parser_args.paradigm}_train_*.bin"
-args.train_files = f"{arg_parser_args.language}_{arg_parser_args.paradigm}_CORPUS/{arg_parser_args.language}_{arg_parser_args.paradigm}_val_*.bin"
+os.environ["DATA_PATH"] = cli_args.data_path
+data_path = os.environ.get("DATA_PATH", ".")
+args.train_files = f"{cli_args.language}_{cli_args.paradigm}_CORPUS/{cli_args.language}_{cli_args.paradigm}_train_*.bin"
+args.val_files = f"{cli_args.language}_{cli_args.paradigm}_CORPUS/{cli_args.language}_{cli_args.paradigm}_val_*.bin"
+args.train_files = os.path.join(data_path, args.train_files)
+args.val_files = os.path.join(data_path, args.val_files)
 
 
 config = Config.load(cli_args.model_config)
@@ -608,7 +624,7 @@ config = Config.load(cli_args.model_config)
 # begin logging
 logfile = None
 if master_process:
-    run_id = f"{config.language}_{config.paradigm}_{uuid.uuid4()}"
+    run_id = f"{config.language}_{config.paradigm}_{config.suffix}_{uuid.uuid4()}"
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
     print(logfile)
@@ -631,7 +647,13 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=config.vocab_size, num_layers=config.num_layers, num_heads=config.num_heads, model_dim=config.d_model, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=config.vocab_size,
+                       num_layers=config.num_layers,
+                       num_heads=config.num_heads,
+                       model_dim=config.d_model,
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len),
+                       u_net_ledges=config.u_net_ledges
+                       ).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -680,7 +702,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 
 # -----------------------------------------------------------------------------
 # hooking tracking with weights and biases
-wandb.init(project=f"{arg_parser_args.language}_{arg_parser_args.paradigm}")
+wandb.init(project=f"{cli_args.language}_{cli_args.paradigm}")
 wandb.watch(model, log="all", loq_freq=100)
 
 ########################################
@@ -691,7 +713,7 @@ wandb.watch(model, log="all", loq_freq=100)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -707,7 +729,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -726,7 +748,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_eos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
