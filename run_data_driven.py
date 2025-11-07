@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 import argparse
-from .config import Config
+from config import Config
 
 # 我的logging...
 import wandb
@@ -535,8 +535,8 @@ def _load_data_shard(file: Path):
     return tokens
 
 # find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
-def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
-    boundary_mask = tokens[pos : pos + max_batch_span] == 50256
+def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int, eos_id: int):
+    boundary_mask = tokens[pos : pos + max_batch_span] == eos_id
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
     starts = []
@@ -549,7 +549,7 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
             start = end
     assert False # increase max_batch_span if necessary
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_eos: bool):
+def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_eos: bool, eos_id: int):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
@@ -562,7 +562,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         if align_to_eos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
+            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span, eos_id)
             start_idx = batch_starts[rank]
         else:
             batch_span = batch_size
@@ -713,7 +713,7 @@ wandb.watch(model, log="all", loq_freq=100)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True, eos_id=config.eos_id)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -729,7 +729,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True, eos_id=config.eos_id)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -748,7 +748,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_eos=False)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_eos=True)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):

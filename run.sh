@@ -1,5 +1,6 @@
 language="eng"
-paradigm="syl"
-global_data_path = "/mnt/data/shared/timo/Updated/data"
+paradigm="bpe"
+global_data_path="/content/data"
+config_path="/content/model_template.json"
 
-torchrun --standalone --nproc_per_node=8 train_gpt.py $global_data_path $paradigm $language
+torchrun --standalone --nproc_per_node=1 /content/modded-nanogpt/run_data_driven.py $config_path $global_data_path $paradigm $language
