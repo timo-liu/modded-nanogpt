@@ -40,8 +40,8 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
     @torch.compile
     def impl(x: Tensor, w: Tensor):
         assert x.is_contiguous() and w.is_contiguous()
-        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
-        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+        x_f8 = x.div(x_s).to(torch.float8_e5m2)
+        w_f8 = w.div(w_s).to(torch.float8_e5m2)
         out = torch._scaled_mm(
             x_f8,
             w_f8.T,
@@ -60,7 +60,7 @@ def _(x: Tensor, w: Tensor, *_):
     assert x.shape[1] == w.shape[1]
     assert x.device == w.device
     assert x.is_contiguous() and w.is_contiguous()
-    return x @ w.T, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+    return x @ w.T, x.to(torch.float8_e5m2), w.to(torch.float8_e5m2)
 
 @torch.library.custom_op("nanogpt::mm_backward", mutates_args=())
 def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
@@ -390,7 +390,7 @@ class Block(nn.Module):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         # similar intuition to Unet value embedding skipping UPDATE
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len, head_dim=dim//num_heads) if layer_idx != 7 else None
         self.mlp = MLP(dim)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
@@ -440,7 +440,7 @@ class GPT(nn.Module):
         self.lm_head.weight.lr_mul = 27.5
         self.scalars.lr_mul = 5.0
 
-    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor, eos_id : int = 50526):
+    def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor, eos_id : int = 286):
         BLOCK_SIZE = 128
         docs = (input_seq == eos_id).cumsum(0)
 
@@ -492,7 +492,7 @@ class GPT(nn.Module):
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        block_masks = [long_bm if i % 2 == 0 else short_bm for i in range(len(self.blocks))]
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
@@ -703,7 +703,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 # -----------------------------------------------------------------------------
 # hooking tracking with weights and biases
 wandb.init(project=f"{cli_args.language}_{cli_args.paradigm}")
-wandb.watch(model, log="all", loq_freq=100)
+wandb.watch(model, log="all")
 
 ########################################
 #            Warmup kernels            #
@@ -713,7 +713,7 @@ wandb.watch(model, log="all", loq_freq=100)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True, eos_id=config.eos_id)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=False, eos_id=config.eos_id)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -729,7 +729,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=True, eos_id=config.eos_id)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_eos=False, eos_id=config.eos_id)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -748,7 +748,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_eos=True)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_eos=False, eos_id=config.eos_id)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -773,7 +773,9 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    loss = model(inputs, targets, get_window_size_blocks(step))
+    wandb.log({"train/loss": loss, "step": step})
+    loss.backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
