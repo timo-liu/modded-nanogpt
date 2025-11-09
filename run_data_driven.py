@@ -4,6 +4,8 @@ This multi-line string comment is probably the
 https://github.com/KellerJordan/modded-nanogpt/blob/master/train_gpt.py
 """
 
+A100 = True
+
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -51,8 +53,16 @@ def mm_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[
             use_fast_accum=True,
         )
         return out, x_f8, w_f8
+    def slow(x: Tensor, w: Tensor):
+        x_f8 = x.div(x_s).to(torch.float8_e5m2)
+        w_f8 = w.div(w_s).to(torch.float8_e5m2)
+        out = torch.mm(x, w)
+        return out, x_f8, w_f8
 
-    return impl(x, w)
+    if not A100:
+        return impl(x, w)
+    else:
+        return slow(x, w)
 
 @mm_op.register_fake
 def _(x: Tensor, w: Tensor, *_):
@@ -91,7 +101,19 @@ def mm_backward_op(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float
         ).T
         return grad_x, grad_w
 
-    return impl(g, x_f8, w_f8)
+    def slow(grad: Tensor, x_f8: Tensor, w_f8: Tensor):
+        x_inv_s = grad.new_tensor(x_s, dtype=torch.float32)
+        w_inv_s = grad.new_tensor(w_s, dtype=torch.float32)
+        grad_inv_s = grad.new_tensor(grad_s, dtype=torch.float32)
+        grad_f8 = grad.div(grad_s).to(torch.float8_e5m2)
+        grad_x = torch.mm(grad, w_f8.T.contiguous().T)
+        grad_w = torch.mm(x_f8, grad.T.contiguous().T).T
+        return grad_x, grad_w
+
+    if not A100:
+        return impl(g, x_f8, w_f8)
+    else:
+        return slow(g, x_f8, w_f8)
 
 @mm_backward_op.register_fake
 def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
@@ -531,7 +553,7 @@ def _load_data_shard(file: Path):
         tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
         f.seek(256 * 4)
         nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
-        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+        #assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
 # find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap

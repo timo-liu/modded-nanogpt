@@ -4,6 +4,24 @@ import json
 
 # this config file will help me keep my head straight, I hope
 
+"""
+config example
+{
+  "language": "eng",
+  "paradigm": "bpe",
+  "suffix": "",
+  
+  "d_model": 768,
+  "num_heads": 12,
+  "vocab_size": 50257,
+  "num_layers": 12,
+  "max_seq_len": 1024,
+  
+  "u_net_ledges": 3,
+  "eos_id": 286
+}
+"""
+
 @dataclass
 class Config:
     # experimental properties configuration. This is more for recording, and will not generally impact training behavior
