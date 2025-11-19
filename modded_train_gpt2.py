@@ -70,9 +70,16 @@ argparser.add_argument('config', type=str)
 argparser.add_argument('data_path', type=str)
 argparser.add_argument('weights_path', type=str)
 argparser.add_argument('--pretraining', type=bool, default=True)
+argparser.add_argument('out_path', type=str)
 cli_args = argparser.parse_args()
 config = GPTConfig.load(args.cli_args)
 wandb.init(project=f"{config.language}_{config.paradigm}", name=config.suffix)
+
+# set vocab to next multiple of 128
+def next_multiple_of_128(v: int):
+    return next(x for x in range(128, int(128) + 1 + 128, 128) if x >= v)
+
+args.vocab_size = next_multiple_of_128(args.vocab_size)
 
 args.val_files = f"{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_val_*.bin"
 args.train_files = os.path.join(cli_args.data_path, args.train_files)
@@ -614,6 +621,10 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+
+# saving the model
+PATH = os.path.join(cli_args.out_path, f"{config.language}_{config.paradigm}.pth")
+torch.save(model.state_dict(), PATH)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
