@@ -68,6 +68,8 @@ args = Hyperparameters()
 argparser = argparse.ArgumentParser()
 argparser.add_argument('config', type=str)
 argparser.add_argument('data_path', type=str)
+argparser.add_argument('weights_path', type=str)
+argparser.add_argument('--pretraining', type=bool, default=True)
 cli_args = argparser.parse_args()
 config = GPTConfig.load(args.cli_args)
 wandb.init(project=f"{config.language}_{config.paradigm}", name=config.suffix)
@@ -135,7 +137,7 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+    def __init__(self, params, lr=0.02 if cli_args.pretraining else 0.0002, momentum=0.95, nesterov=True,
                  backend='newtonschulz5', backend_steps=5):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
@@ -468,8 +470,13 @@ x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
-num_vocab = 50304
+num_vocab = 50048 # change num vocab to reflect nearest multiple of 128 to our small 50k vocab size
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+
+if not cli_args.pretraining:
+    state_dict = torch.load(os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
+    model.load_state_dict(state_dict)
+
 model = model.cuda().bfloat16()
 for m in model.modules():
     if isinstance(m, CastedLinear):
@@ -489,13 +496,13 @@ enable_mem_efficient_sdp(False)
 enable_math_sdp(False)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6,   betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008, betas=(0.8, 0.95), fused=True)
+optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.6 if cli_args.pretraining else 0.006,   betas=(0.8, 0.95), fused=True)
+optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.008 if cli_args.pretraining else 0.0008, betas=(0.8, 0.95), fused=True)
 params = list(raw_model.transformer.h.parameters())
 matrix_params = [p for p in params if p.ndim == 2]
 scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
-optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
-optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
+optimizer3 = Muon(matrix_params, lr=0.05 if cli_args.pretraining else 0.0005, momentum=0.95)
+optimizer4 = torch.optim.Adam(scalar_params, lr=0.04 if cli_args.pretraining else 0.0004, betas=(0.8, 0.95), fused=True) # note that this learning rate is neither sensitive nor tuned
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
@@ -610,6 +617,14 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+# store the weights before destroying the process group
+parameters = model.state_dict()
+
+if cli_args.pretraining:
+    torch.save(os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
+else:
+    torch.save(os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
 
 # -------------------------------------------------------------------------
 # clean up nice
