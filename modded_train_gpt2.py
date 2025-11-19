@@ -71,6 +71,7 @@ argparser.add_argument('data_path', type=str)
 argparser.add_argument('weights_path', type=str)
 argparser.add_argument('--pretraining', type=bool, default=True)
 argparser.add_argument('out_path', type=str)
+argparser.add_argument('cross_val_counter', type=int)
 cli_args = argparser.parse_args()
 config = GPTConfig.load(args.cli_args)
 wandb.init(project=f"{config.language}_{config.paradigm}", name=config.suffix)
@@ -621,10 +622,6 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
-
-# saving the model
-PATH = os.path.join(cli_args.out_path, f"{config.language}_{config.paradigm}.pth")
-torch.save(model.state_dict(), PATH)
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")

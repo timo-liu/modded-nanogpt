@@ -84,37 +84,54 @@ def main(DATA_PATH : str):
     print(f"✅ Saved {len(all_sentences)} sentences to {out_path}")
     return out_path
 
-def unpack_and_syllabize(stored_path : str, bin_path : str, tokenizer):
+def unpack_and_syllabize(stored_path : str, bin_path : str, tokenizer, cross_val_counter : str):
+    COMPLETE_SET_SIZE = 1000
+    holdout_set_size = COMPLETE_SET_SIZE//cross_val_counter
     with open(stored_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    with_syllables = []
+    for s in data:
+        sentence = s["sentence"]
+        ids = tokenizer.tokenize_with_eos(sentence)
+        syllables = len(syllabize(sentence))[0]
+        assert syllables <= 31, "Uhoh too big"
+        ids.insert(-1, tokenizer.vocab.get(f"<{syllables}>"))
+        with_syllables.append(ids)
+    for i in range(cross_val_counter):
+        test_slice = with_syllables[i*holdout_set_size:(i+1)*holdout_set_size]
+        train_slice = with_syllables[:i * holdout_set_size] + with_syllables[(i + 1) * holdout_set_size:]
+        put_into_file(test_slice, tokenizer.language, tokenizer.paradigm, syllables, test, i)
+        put_into_file(train_slice, tokenizer.language, tokenizer.paradigm, syllables, train, i)
 
-    def write_datafile(filename, toks):
-        """
-        Saves token data as a .bin file, for reading in C.
-        - First comes a header with 256 int32s
-        - The tokens follow, each as a uint16
-        """
-        assert len(toks) < 2 ** 31, "token count too large"  # ~2.1B tokens
-        # construct the header
-        header = np.zeros(256, dtype=np.int32)
-        header[0] = 20240520  # magic
-        header[1] = 1  # version
-        header[2] = len(toks)  # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
-        # construct the tokens numpy array, if not already
-        if not isinstance(toks, np.ndarray) or not toks.dtype == np.uint16:
-            # validate that no token exceeds a uint16
-            maxtok = 2 ** 16
-            assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
-            toks_np = np.array(toks, dtype=np.uint16)
-        else:
-            toks_np = toks
-        # write to file
-        print(f"writing {len(toks):,} tokens to {filename}")
-        with open(filename, "wb") as f:
-            f.write(header.tobytes())
-            f.write(toks_np.tobytes())
 
-def put_into_file(ids, path : str, language : str, paradigm : str, task : str):
+
+def write_datafile(filename, toks):
+    """
+    Saves token data as a .bin file, for reading in C.
+    - First comes a header with 256 int32s
+    - The tokens follow, each as a uint16
+    """
+    assert len(toks) < 2 ** 31, "token count too large"  # ~2.1B tokens
+    # construct the header
+    header = np.zeros(256, dtype=np.int32)
+    header[0] = 20240520  # magic
+    header[1] = 1  # version
+    header[2] = len(toks)  # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
+    # construct the tokens numpy array, if not already
+    if not isinstance(toks, np.ndarray) or not toks.dtype == np.uint16:
+        # validate that no token exceeds a uint16
+        maxtok = 2 ** 16
+        assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
+        toks_np = np.array(toks, dtype=np.uint16)
+    else:
+        toks_np = toks
+    # write to file
+    print(f"writing {len(toks):,} tokens to {filename}")
+    with open(filename, "wb") as f:
+        f.write(header.tobytes())
+        f.write(toks_np.tobytes())
+
+def put_into_file(ids, path : str, language : str, paradigm : str, task : str, split : str, cvc : int):
     """
     Adapted from the NanoGPT Speedrun code
     Script kiddie, GO!
@@ -148,10 +165,9 @@ def put_into_file(ids, path : str, language : str, paradigm : str, task : str):
         space = shard_size - token_count
         if space == 0:
             # shard full: write and open new one
-            split = "val" if shard_index == 0 else "train"
             outname = os.path.join(
                 path,
-                f"{task}_{language}_{paradigm}_{split}_{shard_index:06d}.bin"
+                f"{task}_{language}_{paradigm}_{split}_{cvc}_{shard_index:06d}.bin"
             )
             write_datafile(outname, all_tokens_np)
             shard_index += 1
@@ -172,6 +188,7 @@ if __name__ == "__main__":
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("tokenizers_folder", type=str, help="Absolute Path to tokenizer folder")
     arg_parser.add_argument("tokenizer_config", type=str, help="trained config path")
+    arg_parser.add_argument("--cross_val_sets", type=int, default=10)
 
     args = arg_parser.parse_args()
 
@@ -184,7 +201,6 @@ if __name__ == "__main__":
     TOKENIZER_CONFIG = TokenizerConfig.load()
     tokenizer = Tokenizer(TOKENIZER_CONFIG)
 
-
     DATA_PATH = "spanish_data"
     if not os.path.exists(DATA_PATH):
         os.makedirs(DATA_PATH, exist_ok=True)
@@ -192,8 +208,8 @@ if __name__ == "__main__":
         if not os.path.exists(BIN_PATH):
             os.makedirs(BIN_PATH)
         stored_path = main(DATA_PATH)
-        pack(stored_path, BIN_PATH, tokenizer)
+        unpack_and_syllabize(stored_path, BIN_PATH, tokenizer)
     else:
         stored_path = f"{DATA_PATH}/fluentwithstories_spanish.json"
         BIN_PATH = os.path.join(DATA_PATH, "bins")
-        pack(stored_path, BIN_PATH, tokenizer)
+        unpack_and_syllabize(stored_path, BIN_PATH, tokenizer)

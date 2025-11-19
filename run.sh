@@ -12,10 +12,13 @@ languages=("eng" "span")
 paradigms=("syl" "bpe" "morf")
 data_path=""
 out_path=""
+cross_val_counter=(0,1,2,3,4,5,6,7,8,9)
 
 for lang in "${languages[@]}"; do
   for p in "${paradigms[@]}"; do
-    config="${lang}_${p}_config.json"
-    torchrun --standalone --nproc_per_node=1 modded_train_gpt2.py "$config" "$data_path" "$out_path"
+    for c in ${cross_val_counter[@]}; do
+      config="${lang}_${p}_config.json"
+      torchrun --standalone --nproc_per_node=1 modded_train_gpt2.py "$config" "$data_path" "$out_path" $c
+      done
   done
 done
