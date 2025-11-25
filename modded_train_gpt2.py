@@ -60,7 +60,7 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 500 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
 # -----------------------------------------------------------------------------
@@ -69,9 +69,10 @@ argparser = argparse.ArgumentParser()
 argparser.add_argument('config', type=str)
 argparser.add_argument('data_path', type=str)
 argparser.add_argument('weights_path', type=str)
-argparser.add_argument('--pretraining', type=bool, default=True)
 argparser.add_argument('out_path', type=str)
-argparser.add_argument('cross_val_counter', type=int)
+argparser.add_argument('--pretraining', type=bool, default=True)
+argparser.add_argument('--task', type=str)
+argparser.add_argument('--cross_val_counter', type=int)
 cli_args = argparser.parse_args()
 config = GPTConfig.load(args.cli_args)
 wandb.init(project=f"{config.language}_{config.paradigm}", name=config.suffix)
@@ -82,9 +83,15 @@ def next_multiple_of_128(v: int):
 
 args.vocab_size = next_multiple_of_128(args.vocab_size)
 
-args.val_files = f"{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_val_*.bin"
-args.train_files = os.path.join(cli_args.data_path, args.train_files)
-args.val_files = os.path.join(cli_args.data_path, args.val_files)
+if cli_args.pretraining:
+    args.input_bin = f"{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_train_*.bin"
+    args.input_val_bin = f"{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_val_*.bin"
+else:
+    args.input_bin = f"{cli_args.task}_{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_train_{cli_args.cross_val_counter}_*.bin"
+    args.input_val_bin = f"{cli_args.task}_{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_val_{cli_args.cross_val_counter}_*.bin"
+
+args.input_bin = os.path.join(cli_args.data_path, args.input_bin)
+args.input_val_bin = os.path.join(cli_args.data_path, args.input_val_bin)
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -630,9 +637,9 @@ if master_process:
 parameters = model.state_dict()
 
 if cli_args.pretraining:
-    torch.save(os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
+    torch.save(parameters, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
 else:
-    torch.save(os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
+    torch.save(parameters, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
 
 # -------------------------------------------------------------------------
 # clean up nice

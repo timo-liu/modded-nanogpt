@@ -8,6 +8,8 @@ from urllib.parse import urljoin
 from syltippy import syllabize
 import sys
 import argparse
+import numpy as np
+from tqdm import tqdm
 
 BASE_URL = "https://www.fluentwithstories.com"
 START_URL = f"{BASE_URL}/stories/es"
@@ -93,17 +95,36 @@ def unpack_and_syllabize(stored_path : str, bin_path : str, tokenizer, cross_val
     for s in data:
         sentence = s["sentence"]
         ids = tokenizer.tokenize_with_eos(sentence)
-        syllables = len(syllabize(sentence))[0]
-        assert syllables <= 31, "Uhoh too big"
-        ids.insert(-1, tokenizer.vocab.get(f"<{syllables}>"))
-        with_syllables.append(ids)
+        syllables = len(syllabize(sentence)[0])
+        if syllables <= 30:
+            ids.insert(-1, tokenizer.vocab.get(f"<{syllables}>"))
+            with_syllables.append(ids)
+    with_syllables = with_syllables[:COMPLETE_SET_SIZE]
     for i in range(cross_val_counter):
         test_slice = with_syllables[i*holdout_set_size:(i+1)*holdout_set_size]
         train_slice = with_syllables[:i * holdout_set_size] + with_syllables[(i + 1) * holdout_set_size:]
-        put_into_file(test_slice, tokenizer.language, tokenizer.paradigm, syllables, test, i)
-        put_into_file(train_slice, tokenizer.language, tokenizer.paradigm, syllables, train, i)
+        put_into_file(test_slice, bin_path, tokenizer.language, tokenizer.paradigm, "syllables", "test", i)
+        put_into_file(train_slice, bin_path, tokenizer.language, tokenizer.paradigm, "syllables", "train", i)
 
-
+def unpack_and_wordize(stored_path : str, bin_path : str, tokenizer, cross_val_counter : str):
+    COMPLETE_SET_SIZE = 1000
+    holdout_set_size = COMPLETE_SET_SIZE//cross_val_counter
+    with open(stored_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    with_words = []
+    for s in data:
+        sentence = s["sentence"]
+        ids = tokenizer.tokenize_with_eos(sentence)
+        wc = len(sentence.split())
+        if wc <= 30:
+            ids.insert(-1, tokenizer.vocab.get(f"<{wc}>"))
+            with_words.append(ids)
+    with_words = with_words[:COMPLETE_SET_SIZE]
+    for i in range(cross_val_counter):
+        test_slice = with_words[i*holdout_set_size:(i+1)*holdout_set_size]
+        train_slice = with_words[:i * holdout_set_size] + with_words[(i + 1) * holdout_set_size:]
+        put_into_file(test_slice, bin_path, tokenizer.language, tokenizer.paradigm, "words", "test", i)
+        put_into_file(train_slice, bin_path, tokenizer.language, tokenizer.paradigm, "words", "train", i)
 
 def write_datafile(filename, toks):
     """
@@ -182,6 +203,14 @@ def put_into_file(ids, path : str, language : str, paradigm : str, task : str, s
         remaining -= take
         progress_bar.update(take)
 
+    if token_count != 0:
+        outname = os.path.join(
+            path,
+            f"{task}_{language}_{paradigm}_{split}_{cvc}_{shard_index:06d}.bin"
+        )
+        # write only the portion filled
+        write_datafile(outname, all_tokens_np[:token_count])
+
 
 
 if __name__ == "__main__":
@@ -198,7 +227,7 @@ if __name__ == "__main__":
     sys.path.insert(0, tokenizer_directory)
     from TokenizerConfig import TokenizerConfig
     from tokenizer import Tokenizer
-    TOKENIZER_CONFIG = TokenizerConfig.load()
+    TOKENIZER_CONFIG = TokenizerConfig.load(args.tokenizer_config)
     tokenizer = Tokenizer(TOKENIZER_CONFIG)
 
     DATA_PATH = "spanish_data"
@@ -207,9 +236,8 @@ if __name__ == "__main__":
         BIN_PATH = os.path.join(DATA_PATH, "bins")
         if not os.path.exists(BIN_PATH):
             os.makedirs(BIN_PATH)
-        stored_path = main(DATA_PATH)
-        unpack_and_syllabize(stored_path, BIN_PATH, tokenizer)
-    else:
-        stored_path = f"{DATA_PATH}/fluentwithstories_spanish.json"
-        BIN_PATH = os.path.join(DATA_PATH, "bins")
-        unpack_and_syllabize(stored_path, BIN_PATH, tokenizer)
+
+    stored_path = f"{DATA_PATH}/fluentwithstories_spanish.json"
+    BIN_PATH = os.path.join(DATA_PATH, "bins")
+    unpack_and_syllabize(stored_path, BIN_PATH, tokenizer, args.cross_val_sets)
+    unpack_and_wordize(stored_path, BIN_PATH, tokenizer, args.cross_val_sets)

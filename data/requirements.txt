@@ -1,3 +1,7 @@
 requests
 bs4
 syltippy
+torch
+datasets
+sentencepiece
+pylirecouleur
