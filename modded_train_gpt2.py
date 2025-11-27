@@ -32,6 +32,9 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    language : str = ""
+    paradigm : str = ""
+    suffix : str = ""
 
     @classmethod
     def load(cls, config_path):
@@ -51,16 +54,16 @@ class Hyperparameters:
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
-    device_batch_size : int = 1 # batch size, in sequences, per device
+    device_batch_size : int = 2 # batch size, in sequences, per device
     sequence_length : int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1750 # number of iterations to run
     warmup_iters : int = 0
     cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    save_every : int = 500 # every how many steps to save the checkpoint? 0 for only at the end
+    save_every : int = 50 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
 # -----------------------------------------------------------------------------
@@ -74,14 +77,14 @@ argparser.add_argument('--pretraining', type=bool, default=True)
 argparser.add_argument('--task', type=str)
 argparser.add_argument('--cross_val_counter', type=int)
 cli_args = argparser.parse_args()
-config = GPTConfig.load(args.cli_args)
+config = GPTConfig.load(cli_args.config)
 wandb.init(project=f"{config.language}_{config.paradigm}", name=config.suffix)
 
 # set vocab to next multiple of 128
 def next_multiple_of_128(v: int):
     return next(x for x in range(128, int(128) + 1 + 128, 128) if x >= v)
 
-args.vocab_size = next_multiple_of_128(args.vocab_size)
+config.vocab_size = next_multiple_of_128(config.vocab_size)
 
 if cli_args.pretraining:
     args.input_bin = f"{config.language}_{config.paradigm}_CORPUS/{config.language}_{config.paradigm}_train_*.bin"
@@ -568,6 +571,7 @@ for step in range(args.num_iterations + 1):
                 val_loss += model(x_val, y_val, attn_blocksize=attn_blocksize)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
+        wandb.log({'valloss': val_loss})
         # log val loss to console and to logfile
         print0(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
         # start the clock again
@@ -633,13 +637,11 @@ for step in range(args.num_iterations + 1):
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
-# store the weights before destroying the process group
-parameters = model.state_dict()
-
 if cli_args.pretraining:
-    torch.save(parameters, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
+    log = dict(model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+    torch.save(log, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
 else:
-    torch.save(parameters, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
+    torch.save(log, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
 
 # -------------------------------------------------------------------------
 # clean up nice
