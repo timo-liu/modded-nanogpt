@@ -7,6 +7,8 @@ import glob
 import time
 from dataclasses import dataclass
 
+import smtplib
+from email.message import EmailMessage
 import numpy as np
 import torch
 from torch import nn
@@ -25,6 +27,20 @@ import json
 
 # -----------------------------------------------------------------------------
 # model configs
+
+def send_email_gmail(sender: str, recipient: str, subject: str, body: str, app_password: str):
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.ehlo()
+        smtp.login(sender, app_password)      # use App Password here
+        smtp.send_message(msg)
 
 @dataclass
 class GPTConfig:
@@ -47,6 +63,19 @@ class GPTConfig:
                 setattr(obj, k, v)
         return obj
 
+# -----------------------------------------------------------------------------
+# easy argparse
+argparser = argparse.ArgumentParser()
+argparser.add_argument('config', type=str)
+argparser.add_argument('data_path', type=str)
+argparser.add_argument('out_path', type=str)
+argparser.add_argument('--weights_path', type=str)
+argparser.add_argument('--pretraining', type=bool, default=True)
+argparser.add_argument('--task', type=str)
+argparser.add_argument('--cross_val_counter', type=int)
+cli_args = argparser.parse_args()
+config = GPTConfig.load(cli_args.config)
+
 @dataclass
 class Hyperparameters:
     # data hyperparams
@@ -55,30 +84,16 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 2 # batch size, in sequences, per device
-    sequence_length : int = 64*1024 # sequence length, in tokens
-    num_iterations : int = 1750 # number of iterations to run
+    sequence_length : int = 64*1024 if cli_args.pretraining else 128 # sequence length, in tokens
+    num_iterations : int = 1750 if cli_args.pretraining else 100 # number of iterations to run
     warmup_iters : int = 0
-    cooldown_iters : int = 640 # number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
+    cooldown_iters : int = 640 if cli_args.pretraining else 5# number of iterations of linear warmup/cooldown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 10 # every how many steps to evaluate val loss? 0 for only at the end
-    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_tokens : int = 10485760 if cli_args.pretraining else 128# how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 50 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
-
-# -----------------------------------------------------------------------------
-# easy argparse
-argparser = argparse.ArgumentParser()
-argparser.add_argument('config', type=str)
-argparser.add_argument('data_path', type=str)
-argparser.add_argument('weights_path', type=str)
-argparser.add_argument('out_path', type=str)
-argparser.add_argument('--pretraining', type=bool, default=True)
-argparser.add_argument('--task', type=str)
-argparser.add_argument('--cross_val_counter', type=int)
-cli_args = argparser.parse_args()
-config = GPTConfig.load(cli_args.config)
-wandb.init(project=f"{config.language}_{config.paradigm}", name=config.suffix)
 
 # set vocab to next multiple of 128
 def next_multiple_of_128(v: int):
@@ -445,7 +460,8 @@ master_process = (ddp_rank == 0) # this process will do logging, checkpointing e
 # begin logging
 logfile = None
 if master_process:
-    run_id = str(uuid.uuid4())
+    wandb.init(project="tokenization_tests", name=f"{config.language}_{config.paradigm}_{cli_args.pretraining}_{cli_args.task}_{cli_args.cross_val_counter}")
+    run_id = f"{config.language}_{config.paradigm}_{cli_args.pretraining}_{cli_args.task}_{cli_args.cross_val_counter}"
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
@@ -492,8 +508,8 @@ num_vocab = 50048 # change num vocab to reflect nearest multiple of 128 to our s
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 
 if not cli_args.pretraining:
-    state_dict = torch.load(os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
-    model.load_state_dict(state_dict)
+    state_dict = torch.load(os.path.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
+    model.load_state_dict({k.replace('_orig_mod.', ''): v for k, v in torch.load(cli_args.weights_path, map_location="cpu")["model"].items()})
 
 model = model.cuda().bfloat16()
 for m in model.modules():
@@ -585,6 +601,10 @@ for step in range(args.num_iterations + 1):
         # save the state of the training process
         log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
         torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
+        if cli_args.pretraining:
+            torch.save(log, os.path.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_{step}.pth"))
+        else:
+            torch.save(log, os.path.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_{step}_finetuned.pth"))
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -639,10 +659,19 @@ if master_process:
 
 if cli_args.pretraining:
     log = dict(model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-    torch.save(log, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}.pth"))
+    torch.save(log, os.path.join(cli_args.out_path, f"{config.language}_{config.paradigm}.pth"))
 else:
-    torch.save(log, os.join(cli_args.weights_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
+    log = dict(model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+    torch.save(log, os.path.join(cli_args.out_path, f"{config.language}_{config.paradigm}_finetuned.pth"))
 
 # -------------------------------------------------------------------------
 # clean up nice
 dist.destroy_process_group()
+
+SENDER = "tiyliu@ucdavis.edu"
+RECIPIENT = "tiyliu@ucdavis.edu"
+SUBJECT = f"Training completed for {args.language}_{args.paradigm}"
+BODY = "Training done."
+APP_PASSWORD = ""  # 16-character app password (no spaces when using)
+
+send_email_gmail(SENDER, RECIPIENT, SUBJECT, BODY, APP_PASSWORD)

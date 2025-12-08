@@ -103,8 +103,14 @@ def unpack_and_syllabize(stored_path : str, bin_path : str, tokenizer, cross_val
     for i in range(cross_val_counter):
         test_slice = with_syllables[i*holdout_set_size:(i+1)*holdout_set_size]
         train_slice = with_syllables[:i * holdout_set_size] + with_syllables[(i + 1) * holdout_set_size:]
+        val_ratio = 0.1
+        split_idx = int(len(train_slice) * (1 - val_ratio))
+        train_set = train_slice[:split_idx]
+        val_set = train_slice[split_idx:]
         put_into_file(test_slice, bin_path, tokenizer.language, tokenizer.paradigm, "syllables", "test", i)
-        put_into_file(train_slice, bin_path, tokenizer.language, tokenizer.paradigm, "syllables", "train", i)
+        put_into_file(train_set, bin_path, tokenizer.language, tokenizer.paradigm, "syllables", "train", i)
+        put_into_file(val_set, bin_path, tokenizer.language, tokenizer.paradigm, "syllables", "val", i)
+
 
 def unpack_and_wordize(stored_path : str, bin_path : str, tokenizer, cross_val_counter : str):
     COMPLETE_SET_SIZE = 1000
@@ -123,8 +129,13 @@ def unpack_and_wordize(stored_path : str, bin_path : str, tokenizer, cross_val_c
     for i in range(cross_val_counter):
         test_slice = with_words[i*holdout_set_size:(i+1)*holdout_set_size]
         train_slice = with_words[:i * holdout_set_size] + with_words[(i + 1) * holdout_set_size:]
-        put_into_file(test_slice, bin_path, tokenizer.language, tokenizer.paradigm, "words", "test", i)
-        put_into_file(train_slice, bin_path, tokenizer.language, tokenizer.paradigm, "words", "train", i)
+        val_ratio = 0.1
+        split_idx = int(len(train_slice) * (1 - val_ratio))
+        train_set = train_slice[:split_idx]
+        val_set = train_slice[split_idx:]
+        put_into_file(test_slice, bin_path, tokenizer.language, tokenizer.paradigm, "word", "test", i)
+        put_into_file(train_set, bin_path, tokenizer.language, tokenizer.paradigm, "word", "train", i)
+        put_into_file(val_set, bin_path, tokenizer.language, tokenizer.paradigm, "word", "val", i)
 
 def write_datafile(filename, toks):
     """
